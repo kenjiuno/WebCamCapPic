@@ -1,9 +1,12 @@
 ﻿using MediaFoundation;
+using MediaFoundation.Misc;
 using MediaFoundation.ReadWrite;
+using MediaFoundation.Transform;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -113,6 +116,7 @@ namespace WebCamCapPic
                                     Stride = (int)stride,
                                     SampleSize = (int)sampleSize,
                                     DeviceItem = item,
+                                    SubType = subType,
                                 }
                             );
                         }
@@ -131,6 +135,7 @@ namespace WebCamCapPic
             public DeviceItem DeviceItem { get; internal set; }
             public int DescIndex { get; internal set; }
             public int TypeIndex { get; internal set; }
+            public Guid SubType { get; internal set; }
 
             public override string ToString() => Name;
         }
@@ -180,10 +185,43 @@ namespace WebCamCapPic
                     return;
                 }
                 releaser.Add(reader);
-                int frames = 0;
-                while (true)
+
+                IMFTransform transform = null;
+                MFTOutputDataBuffer[] outSamples = null;
+                IMFSample outRgb24Sample = null;
+                IMFMediaBuffer outRgb24Buffer = null;
+
+                int rgbSize = item.Width * item.Height * 3;
+
+                var needToConvert = item.SubType != MFMediaType.RGB24;
+                if (needToConvert)
                 {
-                    var hr = reader.ReadSample(
+                    var processor = new VideoProcessorMFT();
+                    releaser.Add(processor);
+                    transform = (IMFTransform)processor;
+                    HR(transform.SetInputType(0, type, MFTSetTypeFlags.None));
+                    var rgbMediaType = MF.CreateMediaType();
+                    releaser.Add(rgbMediaType);
+                    HR(type.CopyAllItems(rgbMediaType));
+                    HR(rgbMediaType.SetGUID(MFAttributesClsid.MF_MT_SUBTYPE, MFMediaType.RGB24));
+                    HR(rgbMediaType.SetUINT32(MFAttributesClsid.MF_MT_DEFAULT_STRIDE, 3 * item.Width));
+                    HR(rgbMediaType.SetUINT32(MFAttributesClsid.MF_MT_SAMPLE_SIZE, rgbSize));
+                    HR(transform.SetOutputType(0, rgbMediaType, MFTSetTypeFlags.None));
+
+                    outSamples = new MFTOutputDataBuffer[1];
+                    outSamples[0] = new MFTOutputDataBuffer();
+                    outRgb24Sample = MF.CreateSample();
+                    releaser.Add(outRgb24Sample);
+                    outRgb24Buffer = MF.CreateMemoryBuffer(rgbSize);
+                    releaser.Add(outRgb24Buffer);
+                    outRgb24Sample.AddBuffer(outRgb24Buffer);
+                    outSamples[0].pSample = Marshal.GetIUnknownForObject(outRgb24Sample);
+                }
+
+                int frames = 0;
+                while (!stopEvent.WaitOne(0))
+                {
+                    var hrRS = reader.ReadSample(
                         (int)MF_SOURCE_READER.AnyStream,
                         MF_SOURCE_READER_CONTROL_FLAG.None,
                         out int streamIndex,
@@ -196,56 +234,40 @@ namespace WebCamCapPic
                     {
                         try
                         {
-                            sample.GetBufferByIndex(0, out IMFMediaBuffer buff);
-                            try
-                            {
-                                buff.Lock(out IntPtr ptr, out int maxLen, out int curLen);
-                                try
-                                {
-                                    Bitmap pic = new Bitmap(item.Width, item.Height, PixelFormat.Format24bppRgb);
-                                    var bitmapData = pic.LockBits(
-                                        new Rectangle(0, 0, pic.Width, pic.Height),
-                                        ImageLockMode.WriteOnly,
-                                        PixelFormat.Format24bppRgb
-                                    );
-                                    try
-                                    {
-                                        byte[] temp = new byte[curLen];
-                                        Marshal.Copy(ptr, temp, 0, temp.Length);
-                                        Marshal.Copy(temp, 0, bitmapData.Scan0, Math.Min(temp.Length, bitmapData.Stride * bitmapData.Height));
+                            IMFSample rgbSample = sample;
 
+                            if (transform != null)
+                            {
+                                while (true)
+                                {
+                                    var hrPO = transform.ProcessOutput(
+                                        MFTProcessOutputFlags.None,
+                                        1,
+                                        outSamples,
+                                        out ProcessOutputStatus status
+                                    );
+                                    if (hrPO.Succeeded())
+                                    {
+                                        ConsumeBuffer(outRgb24Buffer, item);
                                         frames++;
                                     }
-                                    finally
+                                    else
                                     {
-                                        pic.UnlockBits(bitmapData);
-                                    }
-                                    if (stopEvent.WaitOne(0))
-                                    {
-                                        return;
-                                    }
-                                    pic.RotateFlip(RotateFlipType.RotateNoneFlipY);
-                                    if (IsDisposed)
-                                    {
-                                        return;
-                                    }
-                                    try
-                                    {
-                                        Invoke((Action<Bitmap>)UpdatePreview, pic);
-                                    }
-                                    catch (ObjectDisposedException)
-                                    {
-                                        return;
+                                        break;
                                     }
                                 }
-                                finally
-                                {
-                                    buff.Unlock();
-                                }
+                                var hrPI = transform.ProcessInput(0, sample, 0);
+                                continue;
                             }
-                            finally
+
+                            rgbSample.GetBufferByIndex(0, out IMFMediaBuffer buff);
+                            if (ConsumeBuffer(buff, item))
                             {
-                                Marshal.ReleaseComObject(buff);
+                                frames++;
+                            }
+                            else
+                            {
+                                return;
                             }
                         }
                         finally
@@ -255,6 +277,52 @@ namespace WebCamCapPic
                     }
                 }
             }
+        }
+
+        private bool ConsumeBuffer(IMFMediaBuffer buff, MediaItem item)
+        {
+            buff.Lock(out IntPtr ptr, out int maxLen, out int curLen);
+            try
+            {
+                Bitmap pic = new Bitmap(item.Width, item.Height, PixelFormat.Format24bppRgb);
+                var bitmapData = pic.LockBits(
+                    new Rectangle(0, 0, pic.Width, pic.Height),
+                    ImageLockMode.WriteOnly,
+                    PixelFormat.Format24bppRgb
+                );
+                try
+                {
+                    byte[] temp = new byte[curLen];
+                    Marshal.Copy(ptr, temp, 0, temp.Length);
+                    Marshal.Copy(temp, 0, bitmapData.Scan0, Math.Min(temp.Length, bitmapData.Stride * bitmapData.Height));
+                }
+                finally
+                {
+                    pic.UnlockBits(bitmapData);
+                }
+                if (item.Stride < 0)
+                {
+                    pic.RotateFlip(RotateFlipType.RotateNoneFlipY);
+                }
+                try
+                {
+                    Invoke((Action<Bitmap>)UpdatePreview, pic);
+                    return true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false;
+                }
+            }
+            finally
+            {
+                buff.Unlock();
+            }
+        }
+
+        private void HR(HResult hr)
+        {
+            Debug.Assert(hr.Succeeded());
         }
 
         AutoResetEvent stopEvent = new AutoResetEvent(false);
